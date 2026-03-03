@@ -8,3 +8,4 @@ pyjwt
 passlib
 bcrypt
 gunicorn
+email-validator
