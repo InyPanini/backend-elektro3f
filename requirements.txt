@@ -7,5 +7,4 @@ pydantic-settings
 pyjwt
 passlib
 bcrypt
-zoneinfo
 gunicorn
