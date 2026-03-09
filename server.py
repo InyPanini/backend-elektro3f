@@ -18,11 +18,16 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+mongo_url = os.environ.get('MONGO_URL')
+db_name = os.environ.get('DB_NAME')
 
-# JWT Config - Usiamo una chiave più corta per evitare errori di buffer
+if not mongo_url or not db_name:
+    raise RuntimeError("MONGO_URL or DB_NAME environment variables are missing!")
+
+client = AsyncIOMotorClient(mongo_url)
+db = client[db_name]
+
+# JWT Config
 SECRET_KEY = os.environ.get('JWT_SECRET', 'elektro3f-secret-2026')
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
@@ -90,23 +95,6 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     user: UserResponse
 
-class ShiftAction(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    user_id: str
-    action_type: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    address: Optional[str] = None
-    notes: Optional[str] = None
-
-class ShiftActionCreate(BaseModel):
-    action_type: str
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    address: Optional[str] = None
-    notes: Optional[str] = None
-
 # ==================== HELPER FUNCTIONS ====================
 
 def create_access_token(data: dict):
@@ -116,10 +104,15 @@ def create_access_token(data: dict):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception:
+        return False
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    # Forza la password a stringa e tronca se necessario per sicurezza bcrypt
+    safe_password = str(password)[:71]
+    return pwd_context.hash(safe_password)
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
@@ -135,104 +128,38 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-async def get_admin_user(current_user: dict = Depends(get_current_user)):
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    return current_user
-
 # ==================== SEED ADMIN ACCOUNTS ====================
 
 async def seed_admin_accounts():
-    admin_accounts = [
-        {"email": "info@elektro3f.it", "name": "Admin Info"},
-        {"email": "elektro3fbz@gmail.com", "name": "Admin BZ"}
-    ]
-    # MODIFICA CHIRURGICA: Password più corta e senza simboli per evitare i 72 byte
-    default_password = "Elektro2026" 
-    
-    for admin in admin_accounts:
-        existing = await db.users.find_one({"email": admin["email"]})
-        if not existing:
-            user_data = {
-                "id": str(uuid.uuid4()),
-                "email": admin["email"],
-                "name": admin["name"],
-                "password": hash_password(default_password),
-                "role": "admin",
-                "profile_picture": None,
-                "language": "it",
-                "created_at": datetime.utcnow()
-            }
-            await db.users.insert_one(user_data)
-            logger.info(f"Created admin account: {admin['email']}")
+    try:
+        admin_accounts = [
+            {"email": "info@elektro3f.it", "name": "Admin Info"},
+            {"email": "elektro3fbz@gmail.com", "name": "Admin BZ"}
+        ]
+        # Password di default sicura e corta
+        default_password = "Elektro2026" 
+        
+        for admin in admin_accounts:
+            existing = await db.users.find_one({"email": admin["email"]})
+            if not existing:
+                user_data = {
+                    "id": str(uuid.uuid4()),
+                    "email": admin["email"],
+                    "name": admin["name"],
+                    "password": hash_password(default_password),
+                    "role": "admin",
+                    "profile_picture": None,
+                    "language": "it",
+                    "created_at": datetime.utcnow()
+                }
+                await db.users.insert_one(user_data)
+                logger.info(f"Account admin creato: {admin['email']}")
+            else:
+                logger.info(f"Admin già presente: {admin['email']}")
+    except Exception as e:
+        logger.error(f"Errore durante il seeding: {e}")
 
 @app.on_event("startup")
 async def startup_event():
     await seed_admin_accounts()
-    await db.users.create_index("email", unique=True)
-    await db.users.create_index("id", unique=True)
-    logger.info("Database indexes created and system ready")
-
-# ==================== AUTH ROUTES ====================
-
-@api_router.post("/auth/register", response_model=TokenResponse)
-async def register(user: UserCreate):
-    existing = await db.users.find_one({"email": user.email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    user_data = {
-        "id": str(uuid.uuid4()),
-        "email": user.email,
-        "name": user.name,
-        "password": hash_password(user.password),
-        "role": "employee",
-        "profile_picture": None,
-        "language": "it",
-        "created_at": datetime.utcnow()
-    }
-    await db.users.insert_one(user_data)
-    token = create_access_token({"sub": user_data["id"]})
-    return TokenResponse(
-        access_token=token, 
-        user=UserResponse(
-            id=user_data["id"],
-            email=user_data["email"],
-            name=user_data["name"],
-            role=user_data["role"],
-            language=user_data["language"],
-            created_at=user_data["created_at"]
-        )
-    )
-
-@api_router.post("/auth/login", response_model=TokenResponse)
-async def login(credentials: UserLogin):
-    user = await db.users.find_one({"email": credentials.email})
-    if not user or not verify_password(credentials.password, user["password"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    
-    token = create_access_token({"sub": user["id"]})
-    return TokenResponse(
-        access_token=token, 
-        user=UserResponse(
-            id=user["id"], 
-            email=user["email"], 
-            name=user["name"], 
-            role=user["role"], 
-            profile_picture=user.get("profile_picture"), 
-            language=user.get("language", "it"), 
-            created_at=user["created_at"]
-        )
-    )
-
-# ==================== HEALTH CHECK ====================
-
-@api_router.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
-
-app.include_router(api_router)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+    await db.users.create_index("email",
