@@ -12,7 +12,6 @@ import uuid
 from datetime import datetime, timedelta
 import jwt
 from passlib.context import CryptContext
-import base64
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -65,22 +64,6 @@ logger = logging.getLogger(__name__)
 
 # ==================== MODELS ====================
 
-class UserBase(BaseModel):
-    email: EmailStr
-    name: str
-    role: str = "employee"
-    profile_picture: Optional[str] = None
-    language: str = "it"
-
-class UserCreate(BaseModel):
-    email: EmailStr
-    name: str
-    password: str
-
-class UserLogin(BaseModel):
-    email: EmailStr
-    password: str
-
 class UserResponse(BaseModel):
     id: str
     email: str
@@ -94,6 +77,15 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserResponse
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    name: str
+    password: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -110,23 +102,8 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
 
 def hash_password(password: str) -> str:
-    # Forza la password a stringa e tronca se necessario per sicurezza bcrypt
     safe_password = str(password)[:71]
     return pwd_context.hash(safe_password)
-
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        user = await db.users.find_one({"id": user_id})
-        if user is None:
-            raise HTTPException(status_code=401, detail="User not found")
-        return user
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
 
 # ==================== SEED ADMIN ACCOUNTS ====================
 
@@ -136,7 +113,6 @@ async def seed_admin_accounts():
             {"email": "info@elektro3f.it", "name": "Admin Info"},
             {"email": "elektro3fbz@gmail.com", "name": "Admin BZ"}
         ]
-        # Password di default sicura e corta
         default_password = "Elektro2026" 
         
         for admin in admin_accounts:
@@ -162,4 +138,69 @@ async def seed_admin_accounts():
 @app.on_event("startup")
 async def startup_event():
     await seed_admin_accounts()
-    await db.users.create_index("email",
+    # Qui c'era l'errore della parentesi, ora è sistemato:
+    await db.users.create_index("email", unique=True)
+    await db.users.create_index("id", unique=True)
+    logger.info("Database pronto e sistema online")
+
+# ==================== AUTH ROUTES ====================
+
+@api_router.post("/auth/register", response_model=TokenResponse)
+async def register(user: UserCreate):
+    existing = await db.users.find_one({"email": user.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    user_data = {
+        "id": str(uuid.uuid4()),
+        "email": user.email,
+        "name": user.name,
+        "password": hash_password(user.password),
+        "role": "employee",
+        "profile_picture": None,
+        "language": "it",
+        "created_at": datetime.utcnow()
+    }
+    await db.users.insert_one(user_data)
+    token = create_access_token({"sub": user_data["id"]})
+    return TokenResponse(
+        access_token=token, 
+        user=UserResponse(
+            id=user_data["id"],
+            email=user_data["email"],
+            name=user_data["name"],
+            role=user_data["role"],
+            language=user_data["language"],
+            created_at=user_data["created_at"]
+        )
+    )
+
+@api_router.post("/auth/login", response_model=TokenResponse)
+async def login(credentials: UserLogin):
+    user = await db.users.find_one({"email": credentials.email})
+    if not user or not verify_password(credentials.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    token = create_access_token({"sub": user["id"]})
+    return TokenResponse(
+        access_token=token, 
+        user=UserResponse(
+            id=user["id"], 
+            email=user["email"], 
+            name=user["name"], 
+            role=user["role"], 
+            profile_picture=user.get("profile_picture"), 
+            language=user.get("language", "it"), 
+            created_at=user["created_at"]
+        )
+    )
+
+@api_router.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+app.include_router(api_router)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
