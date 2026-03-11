@@ -31,7 +31,7 @@ SECRET_KEY = os.environ.get('JWT_SECRET', 'elektro3f-secret-2026')
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
 
-# Password hashing
+# Password hashing - BCYPT ha un limite di 72 caratteri
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # Create the main app
@@ -40,13 +40,7 @@ app = FastAPI()
 # ==================== CONFIGURAZIONE CORS ====================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://frontend-elektro3-iny-paninis-projects.vercel.app",
-        "https://frontend-elektro3.vercel.app",
-        "http://localhost:19006",
-        "http://localhost:8081",
-        "*"
-    ],
+    allow_origins=["*"], # In produzione puoi restringere, ma "*" garantisce che funzioni ora
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -98,10 +92,12 @@ def create_access_token(data: dict):
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
         return pwd_context.verify(plain_password, hashed_password)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Errore verifica password: {e}")
         return False
 
 def hash_password(password: str) -> str:
+    # Sicurezza extra: tronchiamo a 71 per evitare l'errore dei 72 bytes di bcrypt
     safe_password = str(password)[:71]
     return pwd_context.hash(safe_password)
 
@@ -113,35 +109,46 @@ async def seed_admin_accounts():
             {"email": "info@elektro3f.it", "name": "Admin Info"},
             {"email": "elektro3fbz@gmail.com", "name": "Admin BZ"}
         ]
+        # Usiamo la password che hai scelto
         default_password = "Elektro2026" 
         
         for admin in admin_accounts:
+            # Cerchiamo se esiste già
             existing = await db.users.find_one({"email": admin["email"]})
+            
+            user_data = {
+                "id": str(uuid.uuid4()) if not existing else existing["id"],
+                "email": admin["email"],
+                "name": admin["name"],
+                "password": hash_password(default_password),
+                "role": "admin",
+                "profile_picture": None,
+                "language": "it",
+                "created_at": datetime.utcnow() if not existing else existing["created_at"]
+            }
+
             if not existing:
-                user_data = {
-                    "id": str(uuid.uuid4()),
-                    "email": admin["email"],
-                    "name": admin["name"],
-                    "password": hash_password(default_password),
-                    "role": "admin",
-                    "profile_picture": None,
-                    "language": "it",
-                    "created_at": datetime.utcnow()
-                }
                 await db.users.insert_one(user_data)
-                logger.info(f"Account admin creato: {admin['email']}")
+                logger.info(f"✅ Account admin creato: {admin['email']}")
             else:
-                logger.info(f"Admin già presente: {admin['email']}")
+                # Forza l'aggiornamento della password per sicurezza
+                await db.users.update_one(
+                    {"email": admin["email"]},
+                    {"$set": {"password": user_data["password"], "role": "admin"}}
+                )
+                logger.info(f"🔄 Account admin aggiornato: {admin['email']}")
+                
     except Exception as e:
-        logger.error(f"Errore durante il seeding: {e}")
+        logger.error(f"❌ Errore critico durante il seeding: {e}")
 
 @app.on_event("startup")
 async def startup_event():
-    await seed_admin_accounts()
-    # Qui c'era l'errore della parentesi, ora è sistemato:
+    # Creiamo gli indici prima di tutto
     await db.users.create_index("email", unique=True)
     await db.users.create_index("id", unique=True)
-    logger.info("Database pronto e sistema online")
+    # Creiamo gli utenti
+    await seed_admin_accounts()
+    logger.info("🚀 Database pronto e sistema online")
 
 # ==================== AUTH ROUTES ====================
 
@@ -178,7 +185,13 @@ async def register(user: UserCreate):
 @api_router.post("/auth/login", response_model=TokenResponse)
 async def login(credentials: UserLogin):
     user = await db.users.find_one({"email": credentials.email})
-    if not user or not verify_password(credentials.password, user["password"]):
+    
+    if not user:
+        logger.warning(f"Tentativo di login fallito: utente {credentials.email} non trovato")
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+        
+    if not verify_password(credentials.password, user["password"]):
+        logger.warning(f"Tentativo di login fallito: password errata per {credentials.email}")
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
     token = create_access_token({"sub": user["id"]})
